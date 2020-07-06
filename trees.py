@@ -24,7 +24,7 @@ class RateTree:
         self.prices = prices
         self.mat = mat
         self.sig = sig
-        self.q = q
+        self.q = q # Todo adjust subsequent calculation to take input q into account
         self.fv = face_value
         self.kappa = kappa
         if r_tree is None:
@@ -52,13 +52,27 @@ class RateTree:
         print(pd.DataFrame(summary, index=['Security']))
         return (price, spot_rate_dur)
 
-    def _fit_ho_lee(self, m_min=0, m_max=1, accuracy=1e-10):
+    def _fit_ho_lee(self, m_min=0, m_max=1, accuracy=1e-10, cont=False):
         ''' fit a Ho and Lee tree to the given data. Possibly pass in min and max possible values for m
             /!\ Assumes the "vol" attribute is a flot (not an array-like) '''
         for k in range(self.mat.size):
-            self._fit_for_p_hl(k, m_min=0, m_max=1, accuracy=1e-10)
+            self._fit_for_p_hl(k, m_min=-.5, m_max=1, accuracy=1e-10, cont=cont)
 
-    def _discount_payoffs(self, p_mat, early=False, sec=None):
+    def _bond_price_with_tree(self, k, zcb_nom=1, cont=False):
+        '''
+        Inputs:
+        *** k: position in the arrays mat and prices, corresponding to the bond we want to price
+        *** get_up_down: get the price of the bond in the down and up state, allowing to fit BDT
+        *** cont: True iif the "continuously compounded" convention is used
+        Outputs:
+        *** matrix of discounted CFs
+        '''
+        zcb_mat = np.zeros((self.mat[k] + 1, self.mat[k] + 1)) # np array containing the price of the bond at each node
+        zcb_mat[:, -1] = zcb_nom * np.ones(self.mat[k] + 1) # prices at maturity, ie time = maturity
+        disc_mat = self._discount_payoffs(zcb_mat, cont=cont)
+        return disc_mat
+
+    def _discount_payoffs(self, p_mat, early=False, sec=None, cont=False):
         ''' Inputs:
             *** p_mat: a matrix of payoffs through time (each column corresponding to the payoff
                 at a maturity (the corresponding maturity in self.mat) and each element in this column
@@ -70,48 +84,32 @@ class RateTree:
             Outputs:
             *** the discounted cash-flows (ie the matrix of prices at different moments) '''
         for time in reversed(range(p_mat.shape[0] - 1)):  # for each previous time, going backwards...
-            #             interv = # time interval in this layer of the tree. TODO TO HANDLE LOWER TIMESTEP
+            # TODO HANDLE LOWER TIMESTEP (IE take time between both intervals and adjust discount to it)
             # the value at the previous layer, in the corresponding node
             for node in range(time + 1):
-                p_mat[node, time] += (self.q * p_mat[node, time + 1] +
-                                      (1 - self.q) * p_mat[node + 1, time + 1]) / (1 + self.r_tree[node, time])
+                if not cont:
+                    p_mat[node, time] += (self.q * p_mat[node, time + 1] +
+                                          (1 - self.q) * p_mat[node + 1, time + 1]) / (1 + self.r_tree[node, time])
+                else:
+                    p_mat[node, time] += (self.q * p_mat[node, time + 1] +
+                                          (1 - self.q) * p_mat[node + 1, time + 1]) * np.exp(-self.r_tree[node, time])
                 # If you can act early and this action decreases the present value of amounts due,
                 # then exercise early
                 if early:
                     val_if_exercise_early = sec.cf_early_exercise(time, self.r_tree[node, time])
-                    #                     print('EARLY EXERCISE')
-                    #                     print('time is', time)
-                    #                     print('Value exercised early is', val_if_exercise_early)
-                    #                     print('Value without early exercise was', p_mat[node, time])
                     if sec.exercise_early(p_mat[node, time], val_if_exercise_early, time, self.r_tree[node, time]):
                         p_mat[node, time] = val_if_exercise_early
         return p_mat
 
     def print_tree(self):
         ''' prints the fitted tree '''
-        to_display = pd.DataFrame(self.r_tree)
+        to_display = pd.DataFrame(self.r_tree * 100)
         to_display.columns = self.mat
         idx = ["-"] * self.r_tree.shape[0]
         idx[0] = "More up branches"
         idx[-1] = "More down branches"
         to_display.index = idx
         print(to_display)
-
-    def _bond_price_with_tree(self, k, get_up_down=False, zcb_nom=1):
-        '''
-        Inputs:
-        *** k: position in the arrays mat and prices, corresponding to the bond we want to price
-        *** get_up_down: get the price of the bond in the down and up state, allowing to fit BDT
-        Outputs:
-        *** price of the k-th bond, resulting from discounting with the given tree
-        *** optionally, also returns up and down price
-        '''
-        zcb_mat = np.zeros((self.mat[k] + 1, self.mat[k] + 1))  # np array containing the price of the bond at each node
-        zcb_mat[:, -1] = zcb_nom * np.ones(self.mat[k] + 1)  # prices at maturity, ie time = maturity
-        disc_mat = self._discount_payoffs(zcb_mat)
-        if get_up_down:
-            return disc_mat[0, 0], disc_mat[0, 1], disc_mat[1, 1]
-        return disc_mat[0, 0]
 
     def _parametrized_layer_hl(self, m, k):
         ''' HO, LEE
@@ -125,7 +123,7 @@ class RateTree:
         for node in range(1, k + 1):
             self.r_tree[node, k] = self.r_tree[0, k] - 2 * node * self.sig
 
-    def _fit_for_p_hl(self, k, m_min=0, m_max=1, accuracy=1e-10):
+    def _fit_for_p_hl(self, k, m_min=0, m_max=1, accuracy=1e-15, cont=False):
         ''' HO, LEE
             Given a position k in the prices and mat arrays, fits the rate tree layer
             corresponding to these, granted the previous layers have already been fitted '''
@@ -133,56 +131,56 @@ class RateTree:
         while abs(m_max - m_min) > accuracy:
             mid = (m_max + m_min) / 2
             self._parametrized_layer_hl(mid, k)
-            error_mid = self._bond_price_with_tree(k) - target
+            error_mid = self._bond_price_with_tree(k, cont=cont)[0,0] - target
             self._parametrized_layer_hl(m_max, k)
-            error_high = self._bond_price_with_tree(k) - target
+            error_high = self._bond_price_with_tree(k, cont=cont)[0,0] - target
             if error_high * error_mid > 0:
                 m_max = mid
             else:
                 m_min = mid
         return mid
 
-    def _fit_bdt(self):
+    def _fit_bdt(self, x0=[15, 1e-4], cont=False):
         from scipy.optimize import minimize
         ''' fit a Ho and Lee tree to the given data. Possibly pass in min and max possible values for m
             /!\ Assumes the "vol" attribute is a flot (not an array-like) '''
         for k, p in enumerate(self.prices):
-            mini = minimize(self._error_fit_bdt, [.1, 0], args=(k,))
+            minimize(self._error_fit_bdt, x0, args=(k,cont))
 
     def _parametrized_layer_bdt(self, r_bar, bdt_sig, k):
         ''' BLACK, DERMAN, TOY
         Inputs:
         *** r_bar (float): value of the maximum interest rate (on the top of the tree)
         *** bdt_sig (float): the 'BDT tree sigma' of that layer, ie the volatility of the log rates at that level
-        *** k: the layer (time) to fill, e.g. k = 1 to fill the two rates after the first two branches.
+        *** k: the layer (time) to fill, e.g. k = 1 to fill the two rates after the first two branches (at depth 1).
         '''
-        self.r_tree[0, k] = r_bar  # the maximum rate at that time
-        for node in range(1, k + 1):
+        for node in range(k + 1):
             self.r_tree[node, k] = r_bar * np.exp(-2 * node * bdt_sig)
 
-    def _error_fit_bdt(self, x0, k):
+    def _error_fit_bdt(self, x0, k, cont=False):
         ''' BLACK, DERMAN, TOY
             Returns a measure of fit error to the BDT model for the k_th (price, volatility), used to fit
             the BDT tree
             INPUTS:
-            *** x0: array-like with the r_bar and bdt_sig to create layer'''
+            *** x0: array-like with the r_bar and bdt_sig to create layer
+            *** k: the layer you want to fit for '''
         # Retrieve arguments
         r_bar = x0[0]
         bdt_sig = x0[1]
-        # make layer with the given parameters
         target_p = self.prices[k]
         # Price error
-        self._parametrized_layer_bdt(r_bar, bdt_sig, k)
-        tree_price, tree_down, tree_up = self._bond_price_with_tree(k, get_up_down=True)
+        self._parametrized_layer_bdt(r_bar, bdt_sig, k) # make layer with the given parameters
+        mat = self._bond_price_with_tree(k, cont=cont)
+        tree_price, tree_down, tree_up = mat[0,0], mat[0,1], mat[1,1]
         error_price = tree_price - target_p  # difference in price
         # Error vol
         tree_sig = 0
         target_sig = 0
         if k >= 1:
             target_sig = self.sig[k - 1]
-            r_d = pow(self.fv / tree_up,
-                      1 / (self.mat[k] - 1)) - 1  # return in the up state (ie k-year rate in the up-state)
-            r_u = pow(self.fv / tree_down, 1 / (self.mat[k] - 1)) - 1
+            # return in the up state (ie k-year rate in the up-state)
+            r_d = np.power(self.fv / tree_up, 1 / (self.mat[k] - 1)) - 1
+            r_u = np.power(self.fv / tree_down, 1 / (self.mat[k] - 1)) - 1
             tree_sig = np.log(r_u / r_d) / 2
         error_vol = 100 * (target_sig - tree_sig)  # difference in vols
         # TODO: adjust the tree to handle other timesteps
