@@ -1,3 +1,6 @@
+'''
+File to perform common conversions between different conventions (rates quoting, day counts...)
+'''
 import numpy as np
 import pandas as pd
 import datetime
@@ -63,3 +66,19 @@ def discount_from_zero(date_1, date_2, zero_rate, make_pct=True, met='30I/360', 
         zero_rate /= 100
     num_days = count_days(date_1, date_2, method=met, T=date_2)
     return 1 / (1 + zero_rate / freq) ** (freq * num_days / 360)
+
+def forward_from_discount(discounts):
+    '''
+    :param discounts: Pandas series indices keys being dates, and values being the discount factor that applies
+        from date1 to that key
+    :return: Pandas series with the forward rate implied by the discount, for each date in index
+    '''
+    fwd = pd.Series()
+    for i in range(len(discounts) - 1):
+        fwd_rate = (discounts.iloc[i] / discounts.iloc[i + 1] - 1) * 360 / count_days(discounts.index[i],
+                                                                                      discounts.index[i + 1],
+                                                                                      method='actual') * 100
+        to_append = pd.Series(data=[fwd_rate],
+                              index=[discounts.index[i]])
+        fwd = fwd.append(to_append)
+    return fwd
